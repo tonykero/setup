@@ -102,9 +102,9 @@ class Setup:
 
     def finalize_partitions(self, root_dir):
         fstab_dir = root_dir.rstrip('/') + '/etc/fstab'
-        shell("genfstab", ['-U', root_dir, '>>', fstab_dir])
-        shell("systemctl", ['daemon-reload'])
-        shell("arch-chroot", [root_dir])
+        shell("pacstrap", ['-K', root_dir, 'base', 'linux', 'linux-firmware'])
+        shell("genfstab", ['-U', '-p', root_dir, '>>', fstab_dir])
+        #shell("systemctl", ['daemon-reload'])
 
     def setup_partitions(self, device: str, partitions: list[Partition]):
         
@@ -123,6 +123,20 @@ class Setup:
         p2 = shell('chpasswd', [], stdin=_stdout)
         return p2
     
+    def setup_grub(self):
+        script_str = """\
+#!/bin/bash
+echo root:root | chpasswd
+pacman -Sy
+pacman -S --noconfirm grub os-prober efibootmgr
+mount --mkdir /dev/sda1 /boot/efi
+grub-install --target=x86_64-efi --bootloader-id=GRUB --efi-directory=/boot/efi
+grub-mkconfig -o /boot/grub/grub.cfg
+"""     
+        with open("/mnt/home/setup.sh", "w") as script_file:
+            script_file.write(script_str)
+
+        shell('arch-chroot', ['/mnt', '/bin/bash', '/home/setup.sh'])
     def __init__(self):
         self.kbd_layout = 'fr-latin1'
         self.device     = '/dev/sda'
@@ -144,7 +158,7 @@ class Setup:
                 "name": "root",
                 "size": "remainder",
                 "type": "root",
-                "mount": "/"
+                "mount": "/mnt"
             }
         ]
 
@@ -154,7 +168,9 @@ class Setup:
         print("Setting up partitions")
         self.setup_partitions(self.device, self.partitions)
         print("Setting up passwd")
-        self.setup_passwd(self.root_pwd)
+        #self.setup_passwd(self.root_pwd)
+
+        self.setup_grub()
 
 setup = Setup()
 setup.exec()
