@@ -4,8 +4,6 @@ import disk
 import shell
 
 class Setup:
-    def setup_kbd_layout(self, layout: str):
-        return shell.Shell('loadkeys', [layout])
 
     def setup_arch(self, root_part):
         root_dir = next(iter(root_part.mountpoints()))
@@ -15,13 +13,29 @@ class Setup:
         shell.Shell("genfstab" ,["-U", "-p", root_dir]).redirect(fstab_dir).raise_run()
 
     
-    def setup_passwd(self, pwd: str, root_part):
-        root_dir = next(iter(root_part.mountpoints()))
+    def setup_passwd(self, pwd: str, root_dir: str):
         echo = shell.Shell("echo", [f"root:{pwd}"])
         chpasswd = shell.Shell('chpasswd', ['--root', root_dir])
 
         echo.pipe(chpasswd).raise_run()
     
+
+    def setup_kbd_layout(self, layout: str, root_dir: str):
+        shell.Shell("echo", [f"KEYMAP={layout}"])         \
+            .redirect(f"{root_dir}/etc/vconsole.conf")  \
+            .raise_run()
+
+    def setup_locale(self, locale: str, root_dir: str):
+        # generate locale
+        shell.Shell("sed", ["-i", f"s/#{locale}/{locale}/", f"{root_dir}/etc/locale.gen"]) \
+            .raise_run()
+        self.chroot(root_dir, "locale-gen")
+
+        # persistent
+        shell.Shell("echo", [f"LANG={locale}"])                  \
+            .redirect(f"{root_dir}/etc/locale.conf")             \
+            .raise_run()
+
     def setup_disk(self) -> dict:
         self.disk.init_label()
         ret = {}
@@ -48,23 +62,23 @@ class Setup:
         if (root_dir == None or efi_dir == None):
             raise Exception(f"Partitions root or efi were not found")
 
-        def chroot(cmd: str, args: list[str]):
+        self.chroot(root_dir, "pacman", ["-Sy"])
+        self.chroot(root_dir, "pacman", ["-S", "--noconfirm", "grub", "efibootmgr"])
+        self.chroot(root_dir, "mount", ["--mkdir", efi_part.loc(), efi_dir])
+        self.chroot(root_dir, "grub-install", ["--target=x86_64-efi", "--bootloader-id=GRUB", f"--efi-directory={efi_dir}"])
+        self.chroot(root_dir, "grub-mkconfig", ["-o", "/boot/grub/grub.cfg"])
+
+    def chroot(self, root_dir: str, cmd: str, args: list[str] = []):
             full_cmd = [cmd] + args
             base_cmd = "arch-chroot"
             base_args = [root_dir]
-            shell.Shell(base_cmd, base_args + full_cmd).raise_run()
-
-        chroot("pacman", ["-Sy"])
-        chroot("pacman", ["-S", "--noconfirm", "grub", "efibootmgr"])
-        chroot("mount", ["--mkdir", efi_part.loc(), efi_dir])
-        chroot("grub-install", ["--target=x86_64-efi", "--bootloader-id=GRUB", f"--efi-directory={efi_dir}"])
-        chroot("grub-mkconfig", ["-o", "/boot/grub/grub.cfg"])
-
+            return shell.Shell(base_cmd, base_args + full_cmd).raise_run()
 
     def __init__(self, dryrun):
         shell.BaseShell.dryrun = dryrun
 
         self.kbd_layout = 'fr-latin1'
+        self.locale     = 'en_US.UTF-8'
         self.device     = '/dev/sda'
         self.root_pwd   = "root"
 
@@ -94,16 +108,22 @@ class Setup:
         self.disk = disk.Disk(self.device)
 
     def exec(self):
+        # Setup Disk
         mounted = self.setup_disk()
-
         root_part = mounted["root"]
         efi_part = mounted["efi"]
 
+        # Bootstrap Arch Linux
         self.setup_arch(root_part)
         self.setup_grub(root_part, efi_part)
+        
+        root_dir = next(iter(root_part.mountpoints()), None)
 
-        print("Setting up passwd")
-        self.setup_passwd(self.root_pwd, root_part)
+        # Setup Base system
+        self.setup_passwd(self.root_pwd, root_dir)
+        # From now, arch can reboot and be minimal & fonctional
+        self.setup_locale(self.locale, root_dir)
+        self.setup_kbd_layout(self.kbd_layout, root_dir)
 
 
     def reset(self):
