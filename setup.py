@@ -18,7 +18,7 @@ class Setup:
         chpasswd = shell.Shell('chpasswd', ['--root', root_dir])
 
         echo.pipe(chpasswd).raise_run()
-    
+
 
     def setup_kbd_layout(self, layout: str, root_dir: str):
         shell.Shell("echo", [f"KEYMAP={layout}"])         \
@@ -35,6 +35,10 @@ class Setup:
         shell.Shell("echo", [f"LANG={locale}"])                  \
             .redirect(f"{root_dir}/etc/locale.conf")             \
             .raise_run()
+
+    def setup_network(self, root_dir: str):
+        self.chroot(root_dir, "pacman", ["-S", "--noconfirm", "dhcpcd"])
+        self.chroot(root_dir, "ln", ["-s", "/usr/lib/systemd/system/dhcpcd.service", "/etc/systemd/system/multi-user.target.wants/dhcpcd.service"])
 
     def setup_disk(self) -> dict:
         self.disk.init_label()
@@ -116,7 +120,7 @@ class Setup:
         # Bootstrap Arch Linux
         self.setup_arch(root_part)
         self.setup_grub(root_part, efi_part)
-        
+
         root_dir = next(iter(root_part.mountpoints()), None)
 
         # Setup Base system
@@ -124,7 +128,9 @@ class Setup:
         # From now, arch can reboot and be minimal & fonctional
         self.setup_locale(self.locale, root_dir)
         self.setup_kbd_layout(self.kbd_layout, root_dir)
-
+        
+        # Setup network
+        self.setup_network(root_dir)
 
     def reset(self):
         self.disk.wipe()
