@@ -13,7 +13,7 @@ class PartType(Enum):
     SWAP        = 3
 
 def parted(disk_name: str, cmd: str, args: list[str]) -> sb.Popen:
-        return Shell("parted", ["--json", disk_name, "-s"] + [cmd] + args).raise_run(stdout=sb.PIPE)
+        return Shell("parted", ["--json", disk_name, "-s"] + [cmd] + args).run(stdout=sb.PIPE)
 
 def align_to(x: int, multiple: int):
     return multiple * ceil(float(x)/float(multiple))
@@ -39,9 +39,55 @@ class Disk:
 
     def print(self) -> dict:
         parted_output = parted(self.name, "unit", ["s", "print"])
-        parted_json = json.load(parted_output.stdout) 
+        parted_json = json.load(parted_output.stdout)
         if "disk" in parted_json:
             return parted_json["disk"]
+
+        if Shell.dryrun:
+            return {
+      "path": "/dev/sda",
+      "size": "266338304s",
+      "model": "Msft Virtual Disk",
+      "transport": "scsi",
+      "logical-sector-size": 512,
+      "physical-sector-size": 4096,
+      "label": "gpt",
+      "max-partitions": 128,
+      "partitions": [
+         {
+            "number": 1,
+            "start": "2048s",
+            "end": "1026047s",
+            "size": "1024000s",
+            "type": "primary",
+            "name": "efi",
+            "filesystem": "fat32",
+            "flags": [
+                "boot", "esp"
+            ]
+         },{
+            "number": 2,
+            "start": "1026048s",
+            "end": "5220351s",
+            "size": "4194304s",
+            "type": "primary",
+            "name": "swap",
+            "filesystem": "linux-swap(v1)",
+            "flags": [
+                "swap"
+            ]
+         },{
+            "number": 3,
+            "start": "5220352s",
+            "end": "134195199s",
+            "size": "128974848s",
+            "type": "primary",
+            "name": "root",
+            "filesystem": "ext4"
+         }
+      ]
+   }
+
 
         raise Exception(f"parted error: disk field was not found for device {self.name}")
     
@@ -126,6 +172,7 @@ class Partition:
             return type_dict[type]
         
         keys = list(type_dict.keys())
+
         raise Exception(f"Partition type {type} was not recognized, possible values are {keys}")
 
     @staticmethod
@@ -141,6 +188,7 @@ class Partition:
             return type_dict[str]
         
         keys = list(type_dict.keys())
+        
         raise Exception(f"Partition type {str} was not recognized, possible values are {keys}")
 
 
@@ -176,13 +224,22 @@ class Partition:
         self.mkpart(offset_start, offset_end)
         
         # assume number is the number of last partition
-        return self.disk.get_partitions()[-1]["number"]
+        parts = self.disk.get_partitions()
+        last = next(reversed(parts), None)
+        
+        if last == None:
+            raise Exception(f"No partitions were found")
+        
+        return last["number"]
 
     def loc(self):
         return f"{self.disk.name}{self.number}"
 
     def mountpoints(self):
         findmnt = Shell("findmnt", ["--json", "-S", self.loc(), "-o", "SOURCE,TARGET"]).run(stdout=sb.PIPE)
+        if Shell.dryrun:
+            return [f"/part_of{self.loc()}"]
+        
         if findmnt.returncode == 0:
             fs_list = json.load(findmnt.stdout)["filesystems"]
             fs_to_mnt = lambda fs: fs["target"]
@@ -212,11 +269,11 @@ class Partition:
     def umount(self):
         if self.type == PartType.SWAP:
             umount = Shell("swapoff", [self.loc()])
-            umount.raise_run()
+            umount.run()
             return
         
         mountpoints = self.mountpoints()
         if len(mountpoints) > 0:
             umount = Shell("umount", ["-R"] + mountpoints)
-            umount.raise_run()
+            umount.run()
 
