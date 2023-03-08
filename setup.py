@@ -1,216 +1,113 @@
 #!/bin/python
 
-from typing import TypedDict
-import subprocess
-import os.path
-
-dryrun = False
-
-class Object(object):
-    pass
-
-def pname(name: str):
-        return f"\'{name}\'"
-
-
-
-def shell(cmd: str, args: list[str] = [], stdin = None, stdout=None, chroot=None, script=False):
-    if chroot != None:
-        chroot_args = " ".join([cmd] + args)
-        cmd = "arch-chroot"
-        args = [chroot, '/bin/bash']
-        if not script:
-            args += ['-c', f"\"{chroot_args}\""]
-        else:
-            args += [chroot_args]
-    global dryrun
-    if dryrun:
-        cmd_str = " ".join([cmd] + args)
-        print(f"DRYRUN: {cmd_str}")
-        obj = Object()
-        setattr(obj, "stdout", None)
-        return obj
-    out = subprocess.Popen([cmd] + args, stdin=stdin, stdout=stdout, stderr=subprocess.PIPE)
-    out.wait()
-    if(out.returncode != 0):
-        output_str = out.stderr.read().decode("utf-8")
-        raise Exception(f"Command failed {out} with message:\n{output_str}")
-    return out
-
-class Partition(TypedDict):
-    name: str
-    type: str
-    size: str
-    mount: str
-
-def get_fs_type(p: Partition):
-    fs_types = {
-        "efi":      "fat32",
-        "swap":     "linux-swap",
-        "normal":   "ext4",
-        "root":     "ext4"
-    }
-    p_type = p["type"]
-    if p_type in fs_types:
-        return fs_types[p_type]
-    
-    keys = ",".join(fs_types.keys())
-    raise Exception(f"Partition type {p_type} is not valid {keys}")
-
-def get_part_end_offset(p: Partition, offset: int):
-    p_size = p["size"]
-    if p_size == "remainder":
-        return ["100%", 0]
-    else:
-        end_offset = offset + int(p_size)
-        return [f"{end_offset}MiB", end_offset]
-    
-def get_root_partition(partitions: list[Partition]):
-    f_parts = list(filter(lambda p: p['type'] == 'root', partitions))
-    if len(f_parts) > 0:
-        return f_parts[0]
-
-    raise Exception("No root partition were found")
+import disk
+import shell
 
 class Setup:
     def setup_kbd_layout(self, layout: str):
-        return shell('loadkeys', [layout])
-    
-    def create_partitions(self, device:str, partitions: list[Partition]):
-        args = [
-            '--script', device,
-            "mklabel", "gpt"
-            ]
-        offset = 1
-        for partition in partitions:
-            name            = pname(partition['name'])
-            fs_type         = get_fs_type(partition)
-            start_offset    = f"{offset}MiB"
-            [end_offset, offset]   = get_part_end_offset(partition, offset)
-            args += ["mkpart", name, fs_type, start_offset, end_offset]
+        return shell.Shell('loadkeys', [layout])
 
-            if partition["type"] == "efi":
-                args += ['set',      '1', 'esp', 'on']
-
-        return shell('parted', args)
-
-    def format_partitions(self, device, partitions):
-        for idx, partition in enumerate(partitions, start=1):
-            _loc = f"{device}{idx}"
-            if partition["type"] in ["root", "normal"]:
-                shell("mkfs.ext4", [_loc])
-            elif partition["type"] == "swap":
-                shell("mkswap", [_loc])
-            elif partition["type"] == "efi":
-                shell("mkfs.fat", ['-F', '32', _loc])
-    
-    def mount_partitions(self, device, partitions):
-        for idx, partition in enumerate(partitions, start=1):
-            _loc = f"{device}{idx}"
-            if partition["type"] == "swap":
-                shell('swapon', [_loc])
-            else:
-                shell('mount', ['--mkdir', _loc, partition["mount"]])
-
-    def finalize_partitions(self, root_dir):
+    def setup_arch(self, root_part):
+        root_dir = next(iter(root_part.mountpoints()))
         fstab_dir = root_dir.rstrip('/') + '/etc/fstab'
-        shell("pacstrap", ['-K', root_dir, 'base', 'linux', 'linux-firmware'])
-        p = shell("genfstab", ['-U', '-p', root_dir], stdout=subprocess.PIPE)
-        if dryrun:
-            return
-        with open(fstab_dir, "w") as fstab_file:
-            fstab_file.write(p.stdout.read().decode("utf-8"))
-
-    def setup_partitions(self, device: str, partitions: list[Partition]):
         
-        self.create_partitions(device, partitions)
-        self.format_partitions(device, partitions)
-        self.mount_partitions(device, partitions)
+        shell.Shell("pacstrap", ['-K', root_dir, 'base', 'linux', 'linux-firmware']).raise_run()
+        shell.Shell("genfstab" ,["-U", "-p", root_dir]).redirect(fstab_dir).raise_run()
 
-        root_dir = get_root_partition(partitions)["mount"]
-        self.finalize_partitions(root_dir)
     
-    def setup_passwd(self, pwd: str):
-        p1 = shell('echo', [f"root:{pwd}"], stdout=subprocess.PIPE)
-        _stdout = None
-        if not dryrun:
-            _stdout = p1.stdout
-        shell('chpasswd', ['--root', '/mnt'], stdin=_stdout)
+    def setup_passwd(self, pwd: str, root_part):
+        root_dir = next(iter(root_part.mountpoints()))
+        echo = shell.Shell("echo", [f"root:{pwd}"])
+        chpasswd = shell.Shell('chpasswd', ['--root', root_dir])
+
+        echo.pipe(chpasswd).raise_run()
     
-    def setup_grub(self):
-        script_str = """\
-#!/bin/bash
-pacman -Sy
-pacman -S --noconfirm grub os-prober efibootmgr
-mount --mkdir /dev/sda1 /boot/efi
-grub-install --target=x86_64-efi --bootloader-id=GRUB --efi-directory=/boot/efi
-grub-mkconfig -o /boot/grub/grub.cfg
-"""     
-        with open("/mnt/home/setup.sh", "w") as script_file:
-            script_file.write(script_str)
-            shell("/home/setup.sh", chroot='/mnt', script=True)
-        
-        #shell('arch-chroot', ['/mnt', '/bin/bash', '/home/setup.sh'], chroot='/mnt')
+    def setup_disk(self) -> dict:
+        self.disk.init_label()
+        ret = {}
+        for part_dict in self.partitions:
+            part_name = part_dict["name"]
+            part_size = part_dict["size"]
+            part_type = part_dict["type"]
+
+            part = self.disk.create_partition(part_name, part_type, part_size)
+            print(part.number)
+            part.format()
+            if part_type != disk.PartType.SWAP and "mount" in part_dict:
+                part.mount(part_dict["mount"])
+            ret[part_name] = part
+        return ret
+
+    def setup_grub(self, root_part, efi_part):
+        part_root_mnt = root_part.mountpoints()
+        part_efi_mnt  = efi_part.mountpoints()
+
+        root_dir = next(iter(part_root_mnt),None)
+        efi_dir  = next(iter(part_efi_mnt),None)
+
+        if (root_dir == None or efi_dir == None):
+            raise Exception(f"Partitions root or efi were not found")
+
+        def chroot(cmd: str, args: list[str]):
+            full_cmd = [cmd] + args
+            base_cmd = "arch-chroot"
+            base_args = [root_dir]
+            shell.Shell(base_cmd, base_args + full_cmd).raise_run()
+
+        chroot("pacman", ["-Sy"])
+        chroot("pacman", ["-S", "--noconfirm", "grub", "efibootmgr"])
+        chroot("mount", ["--mkdir", efi_part.loc(), efi_dir])
+        chroot("grub-install", ["--target=x86_64-efi", "--bootloader-id=GRUB", f"--efi-directory={efi_dir}"])
+        chroot("grub-mkconfig", ["-o", "/boot/grub/grub.cfg"])
 
 
-    def __init__(self):
+    def __init__(self, dryrun):
+        shell.BaseShell.dryrun = dryrun
+
         self.kbd_layout = 'fr-latin1'
         self.device     = '/dev/sda'
         self.root_pwd   = "root"
 
-        self.partitions: list[Partition] = [
+
+        MiB = lambda x: x * 1024 * 1024
+        GiB = lambda x: MiB(x) * 1024
+        self.partitions = [
             {
-                "name": "EFI System",
-                "size": "500",
-                "type": "efi",
+                "name": "efi",
+                "size": MiB(500),
+                "type": disk.PartType.FAT32,
                 "mount": "/boot/efi"
             },
             {
                 "name": "swap",
-                "size": "2000",
-                "type": "swap"
+                "size": GiB(2),
+                "type": disk.PartType.SWAP
             },
             {
                 "name": "root",
-                "size": "remainder",
-                "type": "root",
+                "size": GiB(61.5),
+                "type": disk.PartType.EXT4,
                 "mount": "/mnt"
             }
         ]
 
+        self.disk = disk.Disk(self.device)
+
     def exec(self):
-        print("Setting up keyboard layout")
-        self.setup_kbd_layout(self.kbd_layout)
-        print("Setting up partitions")
-        self.setup_partitions(self.device, self.partitions)
-        
-        self.setup_grub()
+        mounted = self.setup_disk()
+
+        root_part = mounted["root"]
+        efi_part = mounted["efi"]
+
+        self.setup_arch(root_part)
+        self.setup_grub(root_part, efi_part)
 
         print("Setting up passwd")
-        self.setup_passwd(self.root_pwd)
+        self.setup_passwd(self.root_pwd, root_part)
 
 
     def reset(self):
-        for idx, partition in enumerate(self.partitions, start=1):
-            if partition["type"] == "swap":
-                
-                out = shell("swapon", ["--show=NAME"], stdout=subprocess.PIPE)
-                if dryrun:
-                    continue
-                out_str = out.stdout.read().decode("utf-8").strip()
-                swap_list = out_str.split('\n')
-                if len(swap_list) > 0:
-                    swap_list = swap_list[1:]
-                print(swap_list)
-
-                _loc = f"{self.device}{idx}"
-                if _loc in swap_list:
-                    shell("swapoff", [_loc])
-            else:
-                if os.path.ismount(partition["mount"]):
-                    shell("umount", ["-R", partition["mount"]])
-
-        shell("wipefs", ["-a", self.device])
+        self.disk.wipe()
 
 import argparse
 parser = argparse.ArgumentParser()
@@ -220,7 +117,7 @@ args = parser.parse_args()
 
 dryrun = args.dry
 
-setup = Setup()
+setup = Setup(dryrun)
 if args.reset:
     setup.reset()
 setup.exec()
